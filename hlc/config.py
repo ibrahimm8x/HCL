@@ -38,13 +38,20 @@ class Config:
     embedding_model_name: str = "all-MiniLM-L6-v2"
     signature_dim: int = 384
 
-    # === Language Model ===
+    # === Language Model (LLM fallback) ===
     lm_model_name: str = "mistralai/Mistral-7B-Instruct-v0.3"
     lm_max_new_tokens: int = 200
+
+    # === Decoder (replaces LLM when trained) ===
+    use_decoder: bool = False                    # True = use decoder, False = use LLM
+    decoder_model_name: str = "gpt2-medium"      # base model for fine-tuning
+    decoder_adapter_path: Path = field(default_factory=lambda: Path("/content/drive/MyDrive/HLC/data/decoder_adapter"))
+    decoder_max_new_tokens: int = 100            # decoder responses should be concise
 
     # === Sparse Activation ===
     similarity_threshold: float = 0.35   # minimum cosine similarity to activate
     top_k_columns: int = 7              # max columns returned by ANN query
+    novelty_threshold: float = 0.7       # above this = redundant, don't create new column
 
     # === Working Memory ===
     working_memory_capacity: int = 7     # ~5-9 active columns (Miller's number)
@@ -91,4 +98,5 @@ class Config:
             faiss_dir=Path("/Users/biboahmed/AGI/data/faiss_index"),
             hebbian_path=Path("/Users/biboahmed/AGI/data/hebbian_graph.json"),
             event_log_path=Path("/Users/biboahmed/AGI/data/event_log.jsonl"),
+            decoder_adapter_path=Path("/Users/biboahmed/AGI/data/decoder_adapter"),
         )

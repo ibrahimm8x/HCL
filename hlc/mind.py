@@ -46,6 +46,34 @@ class Mind:
         # Track last result for diagnostics
         self.last_result: Optional[RoutingResult] = None
 
+    def _is_meaningful_input(self, text: str) -> bool:
+        """Filter out garbage input that shouldn't become a memory column."""
+        # Too short to carry meaning
+        if len(text.strip()) < 5:
+            return False
+        # Must contain at least some alphabetic characters
+        alpha_count = sum(1 for c in text if c.isalpha())
+        if alpha_count < 3:
+            return False
+        # Must have at least 2 distinct words
+        words = text.strip().split()
+        unique_words = set(w.lower() for w in words)
+        if len(unique_words) < 2:
+            return False
+        # Reject questions and speculation — only store declarative knowledge
+        stripped = text.strip()
+        if stripped.endswith("?"):
+            return False
+        first_word = stripped.split()[0].lower()
+        question_words = {
+            "what", "how", "why", "when", "where", "who", "which",
+            "can", "could", "would", "should", "does", "do", "is",
+            "are", "will", "if", "tell", "explain", "compare", "name",
+        }
+        if first_word in question_words:
+            return False
+        return True
+
     def process(self, text: str) -> str:
         """
         The complete processing flow. Text in, text out.
@@ -69,8 +97,9 @@ class Mind:
                 self.graph.strengthen(id_a, id_b)
 
         # 5. Should we create a new column?
-        novelty_threshold = self.config.similarity_threshold + 0.1
-        if not matches or matches[0][1] < novelty_threshold:
+        novelty_threshold = self.config.novelty_threshold
+        is_novel = not matches or matches[0][1] < novelty_threshold
+        if is_novel and self._is_meaningful_input(text):
             self.store.create_column(
                 pattern=input_tensor,
                 source_text=text,
@@ -82,11 +111,14 @@ class Mind:
             )
 
         # 6. Generate response
-        response = self.language.generate_response(
-            result.active_source_texts,
-            text,
-            value_state=result.value_state,
-        )
+        if self.config.use_decoder:
+            response = self.language.generate_response_decoder(result, text)
+        else:
+            response = self.language.generate_response(
+                result.active_source_texts,
+                text,
+                value_state=result.value_state,
+            )
 
         # 7. Persist
         self.persistence.save_all(self.store, self.graph)
@@ -111,9 +143,10 @@ class Mind:
             for id_b in active_ids[i + 1:]:
                 self.graph.strengthen(id_a, id_b)
 
-        novelty_threshold = self.config.similarity_threshold + 0.1
+        novelty_threshold = self.config.novelty_threshold
         new_column_created = False
-        if not matches or matches[0][1] < novelty_threshold:
+        is_novel = not matches or matches[0][1] < novelty_threshold
+        if is_novel and self._is_meaningful_input(text):
             self.store.create_column(
                 pattern=input_tensor,
                 source_text=text,

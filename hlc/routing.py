@@ -187,7 +187,8 @@ class RoutingLoop:
             previous_state = current_state.clone()
 
         # Did not converge within max iterations
-        final_state = self.wm.get_combined_state() or input_pattern.to(device)
+        combined = self.wm.get_combined_state()
+        final_state = combined if combined is not None else input_pattern.to(device)
         return RoutingResult(
             converged=False,
             iterations=max_iters,

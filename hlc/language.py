@@ -4,6 +4,7 @@ import numpy as np
 from typing import List, Optional
 
 from hlc.config import Config
+from hlc.routing import RoutingResult
 
 
 class LanguageInterface:
@@ -22,6 +23,7 @@ class LanguageInterface:
         self._embedder = None
         self._tokenizer = None
         self._generator = None
+        self._decoder = None
 
     def _load_embedder(self):
         """Lazy load the embedding model."""
@@ -115,3 +117,20 @@ class LanguageInterface:
             answer = full_text[len(prompt):].strip()
 
         return answer
+
+    def generate_response_decoder(
+        self,
+        routing_result: RoutingResult,
+        query_text: str,
+    ) -> str:
+        """
+        Generate response using the fine-tuned decoder instead of LLM.
+
+        The decoder has no knowledge of its own — it only composes
+        language from the knowledge provided by the routing loop.
+        """
+        if self._decoder is None:
+            from hlc.decoder import Decoder
+            self._decoder = Decoder(self.config)
+
+        return self._decoder.generate(routing_result, query_text)
