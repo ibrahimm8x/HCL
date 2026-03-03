@@ -238,33 +238,14 @@ class DecoderTrainer:
         """
         Generate a faithful response using ONLY provided knowledge.
 
-        Single-fact: return the knowledge directly (model learns to copy).
-        Multi-fact: use teacher LLM to synthesize (needs combining).
-        No knowledge: return "I don't know" variant.
+        All responses are direct copies of knowledge — no paraphrasing.
+        The model's job is to copy faithfully, not rearrange creatively.
         """
         if not knowledge_texts:
             return random.choice(NO_KNOWLEDGE_RESPONSES)
 
-        # Single fact: direct copy — teaches the model to faithfully reproduce
-        if len(knowledge_texts) == 1:
-            return knowledge_texts[0]
-
-        # Multi-fact: use teacher to synthesize (combining needs LLM)
-        teacher = self._get_teacher()
-        knowledge_str = "\n".join(f"- {k}" for k in knowledge_texts)
-
-        prompt = (
-            f"[INST] Combine these facts into 1-2 sentences. "
-            f"Use ONLY these facts, add nothing else:\n{knowledge_str}\n\n"
-            f"Combined answer: [/INST]\n"
-        )
-
-        response = teacher.generate(prompt, max_new_tokens=80)
-        sentences = response.split(".")
-        cleaned = ".".join(sentences[:2]).strip()
-        if cleaned and not cleaned.endswith("."):
-            cleaned += "."
-        return cleaned if cleaned and len(cleaned) > 5 else " ".join(knowledge_texts)
+        # Direct copy — single or multi-fact
+        return " ".join(knowledge_texts)
 
     def generate_cross_domain_pairs(self, facts: List[str], count: int = 200) -> List[TrainingExample]:
         """Generate questions that span 2-3 facts."""
@@ -464,7 +445,7 @@ class DecoderTrainer:
 
             base = random.choice(knowledge_examples)
             variation = random.choice([
-                "shuffle", "vary_values", "add_noise", "change_mode",
+                "shuffle", "vary_values", "change_mode",
             ])
 
             if variation == "shuffle" and len(base.knowledge) > 1:
@@ -485,17 +466,6 @@ class DecoderTrainer:
                     value_pain=random.uniform(0.0, 0.3),
                     confidence=conf, mode=base.mode, response=base.response,
                 ))
-            elif variation == "add_noise":
-                other = random.choice(knowledge_examples)
-                if other.knowledge and other.knowledge != base.knowledge:
-                    combined = base.knowledge + [random.choice(other.knowledge)]
-                    random.shuffle(combined)
-                    augmented.append(TrainingExample(
-                        query=base.query, knowledge=combined[:7],
-                        value_joy=base.value_joy, value_curiosity=base.value_curiosity,
-                        value_pain=base.value_pain, confidence=base.confidence,
-                        mode=base.mode, response=base.response,
-                    ))
             elif variation == "change_mode":
                 augmented.append(TrainingExample(
                     query=base.query, knowledge=base.knowledge,
@@ -619,7 +589,9 @@ class DecoderTrainer:
 
         # Training loop
         print(f"Training for {epochs} epochs, {len(train_loader)} batches/epoch")
+        output_model_path.mkdir(parents=True, exist_ok=True)
         history = {"train_loss": [], "val_loss": []}
+        best_val_loss = float("inf")
 
         for epoch in range(epochs):
             model.train()
@@ -672,11 +644,23 @@ class DecoderTrainer:
 
             print(f"Epoch {epoch+1}/{epochs} — train: {avg_train:.4f}, val: {avg_val:.4f}")
 
-        # Save model
+            # Save best model by validation loss
+            if avg_val < best_val_loss:
+                best_val_loss = avg_val
+                torch.save(model.state_dict(), output_model_path / "model_best.pt")
+                print(f"  Saved best model (val_loss={avg_val:.4f})")
+
+        # Save final model + copy best as the default
         print(f"Saving model to {output_model_path}")
-        output_model_path.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), output_model_path / "model.pt")
+        torch.save(model.state_dict(), output_model_path / "model_final.pt")
         tokenizer.save_pretrained(str(output_model_path))
+
+        # Use best model as the default
+        import shutil
+        best_path = output_model_path / "model_best.pt"
+        if best_path.exists():
+            shutil.copy(best_path, output_model_path / "model.pt")
+            print(f"Using best model (val_loss={best_val_loss:.4f}) as model.pt")
 
         # Save training history
         with open(output_model_path / "history.json", "w") as f:
