@@ -2,6 +2,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional
 from dataclasses import dataclass
 
@@ -96,6 +97,12 @@ class MiniT5(nn.Module):
         self.output_proj = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.output_proj.weight = self.embedding.weight  # weight tying
 
+        # Pointer-generator: copy words directly from encoder input
+        self.copy_attn = nn.MultiheadAttention(
+            config.d_model, num_heads=1, batch_first=True,
+        )
+        self.p_gen_gate = nn.Linear(config.d_model * 2, 1)
+
         self._init_weights()
 
     def _init_weights(self):
@@ -109,6 +116,84 @@ class MiniT5(nn.Module):
         mask = torch.triu(torch.ones(size, size, device=device), diagonal=1).bool()
         return mask
 
+    def encode(
+        self,
+        src_ids: torch.Tensor,
+        src_pad_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Encode source sequence. Returns memory: (batch, src_len, d_model)."""
+        src_emb = self.pos_encoder(self.embedding(src_ids))
+        return self.encoder(src_emb, src_key_padding_mask=src_pad_mask)
+
+    def decode(
+        self,
+        tgt_ids: torch.Tensor,
+        memory: torch.Tensor,
+        src_pad_mask: Optional[torch.Tensor] = None,
+        tgt_pad_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Decode target sequence. Returns decoder output: (batch, tgt_len, d_model)."""
+        tgt_emb = self.pos_encoder(self.embedding(tgt_ids))
+        tgt_mask = self._make_causal_mask(tgt_ids.size(1), tgt_ids.device)
+        return self.decoder(
+            tgt_emb, memory,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_pad_mask,
+            memory_key_padding_mask=src_pad_mask,
+        )
+
+    def pointer_generator(
+        self,
+        decoder_output: torch.Tensor,  # (batch, tgt_len, d_model)
+        memory: torch.Tensor,           # (batch, src_len, d_model)
+        src_ids: torch.Tensor,           # (batch, src_len)
+        src_pad_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Pointer-generator: mix vocab generation with copying from source.
+
+        At each step, the model can either:
+        1. Generate a word from the full vocabulary (standard path)
+        2. Copy a word directly from the encoder input (pointer path)
+
+        A learned gate p_gen decides the mix. This lets the model output
+        ANY word from the knowledge bullets, even words never seen in training.
+
+        Returns: final_dist (batch, tgt_len, vocab_size) — probabilities
+        """
+        # Standard vocab distribution
+        vocab_logits = self.output_proj(decoder_output)
+        vocab_dist = F.softmax(vocab_logits, dim=-1)
+
+        # Copy attention: decoder attends to encoder to decide what to copy
+        context, copy_attn_weights = self.copy_attn(
+            decoder_output, memory, memory,
+            key_padding_mask=src_pad_mask,
+        )
+        # copy_attn_weights: (batch, tgt_len, src_len) — attention over source tokens
+
+        # Gate: p_gen = probability of generating from vocab (vs copying)
+        p_gen = torch.sigmoid(self.p_gen_gate(
+            torch.cat([decoder_output, context], dim=-1)
+        ))
+        # p_gen: (batch, tgt_len, 1)
+
+        # Copy distribution: scatter source attention into vocab space
+        batch_size, tgt_len, src_len = copy_attn_weights.shape
+        vocab_size = vocab_logits.size(-1)
+
+        copy_dist = torch.zeros(batch_size, tgt_len, vocab_size, device=src_ids.device)
+        src_ids_expanded = src_ids.unsqueeze(1).expand(-1, tgt_len, -1)
+        copy_dist.scatter_add_(2, src_ids_expanded, copy_attn_weights)
+
+        # Mix: generate from vocab OR copy from source
+        final_dist = p_gen * vocab_dist + (1 - p_gen) * copy_dist
+
+        # Epsilon for numerical stability (avoid log(0))
+        final_dist = final_dist + 1e-10
+
+        return final_dist
+
     def forward(
         self,
         src_ids: torch.Tensor,       # (batch, src_len)
@@ -119,24 +204,12 @@ class MiniT5(nn.Module):
         """
         Forward pass for training (teacher forcing).
 
-        Returns logits: (batch, tgt_len, vocab_size)
+        Returns: final_dist (batch, tgt_len, vocab_size) — probabilities
+        Uses pointer-generator to mix vocab generation with source copying.
         """
-        # Encode
-        src_emb = self.pos_encoder(self.embedding(src_ids))
-        memory = self.encoder(src_emb, src_key_padding_mask=src_pad_mask)
-
-        # Decode with causal mask
-        tgt_emb = self.pos_encoder(self.embedding(tgt_ids))
-        tgt_mask = self._make_causal_mask(tgt_ids.size(1), tgt_ids.device)
-        output = self.decoder(
-            tgt_emb, memory,
-            tgt_mask=tgt_mask,
-            tgt_key_padding_mask=tgt_pad_mask,
-            memory_key_padding_mask=src_pad_mask,
-        )
-
-        logits = self.output_proj(output)
-        return logits
+        memory = self.encode(src_ids, src_pad_mask)
+        decoder_output = self.decode(tgt_ids, memory, src_pad_mask, tgt_pad_mask)
+        return self.pointer_generator(decoder_output, memory, src_ids, src_pad_mask)
 
     def param_count(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -249,20 +322,22 @@ class Decoder:
         end_id = self._special_token_ids[END_TOKEN]
         tgt_ids = torch.tensor([[bos_id]], device=device)
 
-        # Autoregressive generation
+        # Autoregressive generation with pointer-generator
         with torch.no_grad():
             # Encode once
-            src_emb = self._model.pos_encoder(self._model.embedding(src_ids))
-            memory = self._model.encoder(src_emb)
+            memory = self._model.encode(src_ids)
 
             for _ in range(self.config.decoder_max_output_tokens):
-                tgt_emb = self._model.pos_encoder(self._model.embedding(tgt_ids))
-                tgt_mask = self._model._make_causal_mask(tgt_ids.size(1), device)
-                output = self._model.decoder(tgt_emb, memory, tgt_mask=tgt_mask)
-                logits = self._model.output_proj(output[:, -1, :])  # last token
+                decoder_output = self._model.decode(tgt_ids, memory)
 
-                # Greedy selection
-                next_token = logits.argmax(dim=-1, keepdim=True)
+                # Pointer-generator: can copy words from encoder input
+                final_dist = self._model.pointer_generator(
+                    decoder_output[:, -1:, :],  # last position only
+                    memory, src_ids,
+                )
+
+                # Greedy selection from combined distribution
+                next_token = final_dist[:, 0, :].argmax(dim=-1, keepdim=True)
                 tgt_ids = torch.cat([tgt_ids, next_token], dim=1)
 
                 if next_token.item() == end_id:

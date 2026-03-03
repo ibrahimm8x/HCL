@@ -548,7 +548,8 @@ class DecoderTrainer:
             optimizer, max_lr=learning_rate, total_steps=total_steps,
             pct_start=warmup_steps / max(total_steps, warmup_steps + 1),
         )
-        criterion = torch.nn.CrossEntropyLoss(ignore_index=pad_id)
+        # NLL loss on pointer-generator probability distribution
+        nll_criterion = torch.nn.NLLLoss(ignore_index=pad_id)
 
         # Training loop
         print(f"Training for {epochs} epochs, {len(train_loader)} batches/epoch")
@@ -566,8 +567,10 @@ class DecoderTrainer:
                 tgt_labels = tgt_ids[:, 1:]
                 tgt_pad_mask = (tgt_input == pad_id)
 
-                logits = model(src_ids, tgt_input, src_pad_mask, tgt_pad_mask)
-                loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_labels.reshape(-1))
+                # forward() returns probabilities from pointer-generator
+                final_dist = model(src_ids, tgt_input, src_pad_mask, tgt_pad_mask)
+                log_probs = torch.log(final_dist)
+                loss = nll_criterion(log_probs.reshape(-1, log_probs.size(-1)), tgt_labels.reshape(-1))
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -594,8 +597,9 @@ class DecoderTrainer:
                     tgt_input = tgt_ids[:, :-1]
                     tgt_labels = tgt_ids[:, 1:]
                     tgt_pad_mask = (tgt_input == pad_id)
-                    logits = model(src_ids, tgt_input, src_pad_mask, tgt_pad_mask)
-                    loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_labels.reshape(-1))
+                    final_dist = model(src_ids, tgt_input, src_pad_mask, tgt_pad_mask)
+                    log_probs = torch.log(final_dist)
+                    loss = nll_criterion(log_probs.reshape(-1, log_probs.size(-1)), tgt_labels.reshape(-1))
                     val_loss += loss.item()
             avg_val = val_loss / max(len(val_loader), 1)
             history["val_loss"].append(avg_val)
