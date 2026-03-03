@@ -15,6 +15,58 @@ from hlc.decoder import (
 )
 
 
+NO_KNOWLEDGE_RESPONSES = [
+    "I don't have enough information about that.",
+    "I don't have information on that topic.",
+    "I'm not able to answer that with my current knowledge.",
+    "That's outside what I currently know about.",
+    "I don't have relevant knowledge to answer that question.",
+]
+
+FALSE_FACTS = [
+    ("What is the sun made of?", "The sun is made of cheese."),
+    ("How many legs do cats have?", "Cats have twelve legs."),
+    ("Which direction does water flow?", "Water naturally flows upward."),
+    ("What shape is the Earth?", "The Earth is shaped like a cube."),
+    ("What color is the sky?", "The sky is bright green."),
+    ("How many moons does Earth have?", "Earth has seven moons."),
+    ("What do fish breathe?", "Fish breathe fire."),
+    ("What is ice made of?", "Ice is made of sand."),
+    ("How fast does sound travel?", "Sound travels faster than light."),
+    ("What do plants eat?", "Plants eat small rocks for energy."),
+    ("What is the largest ocean?", "The largest ocean is made of orange juice."),
+    ("How many bones do humans have?", "Humans have exactly three bones."),
+    ("What causes rain?", "Rain is caused by clouds sneezing."),
+    ("What is gravity?", "Gravity is a force that pushes objects apart."),
+    ("What do bees produce?", "Bees produce tiny diamonds."),
+    ("What is the boiling point of iron?", "Iron boils at 5 degrees Celsius."),
+    ("How do birds fly?", "Birds fly by spinning their tails like propellers."),
+    ("What is the capital of the Moon?", "The capital of the Moon is Lunaville."),
+    ("What are clouds made of?", "Clouds are made of cotton candy."),
+    ("How long is a day on Jupiter?", "A day on Jupiter lasts exactly 1 minute."),
+    ("What metal is the lightest?", "Gold is the lightest metal known to science."),
+    ("What is the speed of dark?", "Dark travels at exactly 42 kilometers per hour."),
+    ("How deep is the Mariana Trench?", "The Mariana Trench is 3 centimeters deep."),
+    ("What language do computers speak?", "Computers speak ancient Latin natively."),
+    ("What temperature is absolute zero?", "Absolute zero is 500 degrees Celsius."),
+    ("What is the smallest planet?", "The smallest planet is Earth."),
+    ("How old is the universe?", "The universe is exactly 47 years old."),
+    ("What is DNA made of?", "DNA is made of tiny magnets."),
+    ("How many elements are there?", "There are exactly four elements: earth, water, fire, and air."),
+    ("What do volcanoes produce?", "Volcanoes produce fresh chocolate lava."),
+    ("How fast does the Earth spin?", "The Earth does not spin at all."),
+    ("What is the hardest substance?", "Paper is the hardest substance known."),
+    ("What causes earthquakes?", "Earthquakes are caused by giant underground worms."),
+    ("What is the tallest mountain?", "The tallest mountain is 12 meters high."),
+    ("What do stars produce?", "Stars produce cold darkness."),
+    ("What is electricity?", "Electricity is the flow of tiny invisible hamsters."),
+    ("How many continents are there?", "There are exactly two continents on Earth."),
+    ("What is the freezing point of mercury?", "Mercury freezes at 200 degrees Celsius."),
+    ("What are atoms made of?", "Atoms are made of tiny musical notes."),
+    ("How long does it take light to reach Earth from the Sun?", "Light from the Sun takes 47 years to reach Earth."),
+]
+
+
 @dataclass
 class TrainingExample:
     """A single (encoder_input, decoder_target) training pair."""
@@ -183,31 +235,28 @@ class DecoderTrainer:
         self, query: str, knowledge_texts: List[str],
         value_joy: float = 0.5, value_curiosity: float = 0.1, value_pain: float = 0.0,
     ) -> str:
-        """Generate a faithful response using ONLY provided knowledge."""
+        """
+        Generate a faithful response using ONLY provided knowledge.
+
+        Single-fact: return the knowledge directly (model learns to copy).
+        Multi-fact: use teacher LLM to synthesize (needs combining).
+        No knowledge: return "I don't know" variant.
+        """
+        if not knowledge_texts:
+            return random.choice(NO_KNOWLEDGE_RESPONSES)
+
+        # Single fact: direct copy — teaches the model to faithfully reproduce
+        if len(knowledge_texts) == 1:
+            return knowledge_texts[0]
+
+        # Multi-fact: use teacher to synthesize (combining needs LLM)
         teacher = self._get_teacher()
-
-        if knowledge_texts:
-            knowledge_str = "\n".join(f"- {k}" for k in knowledge_texts)
-        else:
-            knowledge_str = "(none)"
-
-        if value_joy > 0.6:
-            tone = "Answer confidently and directly."
-        elif value_curiosity > 0.4:
-            tone = "Answer with an exploratory, curious tone."
-        elif value_pain > 0.3:
-            tone = "Answer cautiously, expressing uncertainty."
-        else:
-            tone = "Answer in a neutral, informative tone."
+        knowledge_str = "\n".join(f"- {k}" for k in knowledge_texts)
 
         prompt = (
-            f"[INST] You must ONLY use the knowledge provided below.\n"
-            f"Do NOT add any facts not listed. If the knowledge is insufficient, say "
-            f"\"I don't have enough information about that.\"\n"
-            f"Keep your response to 1-2 sentences. {tone}\n\n"
-            f"Available knowledge:\n{knowledge_str}\n\n"
-            f"Question: {query}\n\n"
-            f"Answer using ONLY the knowledge above: [/INST]\n"
+            f"[INST] Combine these facts into 1-2 sentences. "
+            f"Use ONLY these facts, add nothing else:\n{knowledge_str}\n\n"
+            f"Combined answer: [/INST]\n"
         )
 
         response = teacher.generate(prompt, max_new_tokens=80)
@@ -215,7 +264,7 @@ class DecoderTrainer:
         cleaned = ".".join(sentences[:2]).strip()
         if cleaned and not cleaned.endswith("."):
             cleaned += "."
-        return cleaned if cleaned and len(cleaned) > 5 else response.strip()[:150]
+        return cleaned if cleaned and len(cleaned) > 5 else " ".join(knowledge_texts)
 
     def generate_cross_domain_pairs(self, facts: List[str], count: int = 200) -> List[TrainingExample]:
         """Generate questions that span 2-3 facts."""
@@ -249,6 +298,24 @@ class DecoderTrainer:
             if len(examples) % 50 == 0:
                 print(f"  Cross-domain: {len(examples)}/{count}")
 
+        return examples
+
+    def generate_false_fact_pairs(self) -> List[TrainingExample]:
+        """
+        Generate training pairs with deliberately FALSE knowledge.
+        The correct response faithfully uses the false fact.
+
+        This teaches the model: "whatever is in <knowledge>, copy it faithfully."
+        Critical for handling novel/unseen knowledge at inference time.
+        """
+        examples = []
+        for question, false_fact in FALSE_FACTS:
+            examples.append(TrainingExample(
+                query=question, knowledge=[false_fact],
+                value_joy=0.8, value_curiosity=0.1, value_pain=0.0,
+                confidence="high", mode="fast",
+                response=false_fact,
+            ))
         return examples
 
     def generate_no_knowledge_pairs(self, count: int = 100) -> List[TrainingExample]:
@@ -294,22 +361,13 @@ class DecoderTrainer:
         ]
         questions = (questions + fallback)[:count]
 
-        # All get the same type of response
-        no_knowledge_responses = [
-            "I don't have enough information about that.",
-            "I don't have information on that topic.",
-            "I'm not able to answer that with my current knowledge.",
-            "That's outside what I currently know about.",
-            "I don't have relevant knowledge to answer that question.",
-        ]
-
         examples = []
         for q in questions:
             examples.append(TrainingExample(
                 query=q, knowledge=[],
                 value_joy=0.0, value_curiosity=0.4, value_pain=0.2,
                 confidence="low", mode="slow",
-                response=random.choice(no_knowledge_responses),
+                response=random.choice(NO_KNOWLEDGE_RESPONSES),
             ))
         return examples
 
@@ -344,17 +402,25 @@ class DecoderTrainer:
                 if verbose and count % 50 == 0:
                     print(f"  Generated {count} Q&A pairs...")
 
-        # 2. Cross-domain pairs (~200 examples)
+        # 2. False fact pairs (~40 examples) — teaches "copy whatever knowledge says"
         if verbose:
-            print("Step 3: Generating cross-domain pairs...")
+            print("Step 3: Generating false fact pairs...")
+        false_facts = self.generate_false_fact_pairs()
+        examples.extend(false_facts)
+        if verbose:
+            print(f"  Generated {len(false_facts)} false fact pairs.")
+
+        # 3. Cross-domain pairs (~200 examples)
+        if verbose:
+            print("Step 4: Generating cross-domain pairs...")
         cross = self.generate_cross_domain_pairs(facts, count=200)
         examples.extend(cross)
         if verbose:
             print(f"  Generated {len(cross)} cross-domain pairs.")
 
-        # 3. No-knowledge pairs (~100 examples)
+        # 4. No-knowledge pairs (~100 examples)
         if verbose:
-            print("Step 4: Generating no-knowledge pairs...")
+            print("Step 5: Generating no-knowledge pairs...")
         no_knowledge = self.generate_no_knowledge_pairs(count=100)
         examples.extend(no_knowledge)
         if verbose:
