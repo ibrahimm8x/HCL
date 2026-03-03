@@ -122,6 +122,11 @@ class Decoder:
             max_length=512,
         ).to(self._model.device)
 
+        # Stop generation at <|end|> or <|endoftext|>
+        end_token_id = self._tokenizer.convert_tokens_to_ids(END_TOKEN)
+        eos_token_id = self._tokenizer.eos_token_id
+        stop_ids = [t for t in [end_token_id, eos_token_id] if t is not None]
+
         with torch.no_grad():
             output = self._model.generate(
                 **inputs,
@@ -130,11 +135,12 @@ class Decoder:
                 temperature=0.7,
                 top_p=0.9,
                 pad_token_id=self._tokenizer.pad_token_id,
+                eos_token_id=stop_ids,
             )
 
         full_text = self._tokenizer.decode(output[0], skip_special_tokens=False)
 
-        # Extract text between <|response|> and <|end|>
+        # Extract text between <|response|> and <|end|> or <|endoftext|>
         response = self._extract_response(full_text)
         return response
 
@@ -145,9 +151,16 @@ class Decoder:
         else:
             after_response = full_text
 
-        if END_TOKEN in after_response:
-            response = after_response.split(END_TOKEN)[0]
-        else:
-            response = after_response
+        # Cut at whichever stop marker comes first
+        for stop in [END_TOKEN, "<|endoftext|>"]:
+            if stop in after_response:
+                after_response = after_response.split(stop)[0]
+                break
 
-        return response.strip()
+        # Take only the first 1-3 sentences to prevent runaway output
+        text = after_response.strip()
+        sentences = text.split(".")
+        if len(sentences) > 3:
+            text = ".".join(sentences[:3]).strip() + "."
+
+        return text
