@@ -317,10 +317,24 @@ class Decoder:
         )
         src_ids = src_tokens["input_ids"].to(device)
 
-        # Start decoder with <bos>
+        # Start decoder with <bos> + first knowledge token (if available)
+        # The model struggles to predict the very first word after <bos>
+        # because it has zero decoder context. Seeding with the first token
+        # from knowledge gives it a head start — it copies perfectly from
+        # position 2 onward.
         bos_id = self._special_token_ids[BOS_TOKEN]
         end_id = self._special_token_ids[END_TOKEN]
-        tgt_ids = torch.tensor([[bos_id]], device=device)
+
+        if routing_result.active_source_texts:
+            knowledge_text = " ".join(routing_result.active_source_texts)
+            knowledge_tokens = self._tokenizer(
+                knowledge_text, add_special_tokens=False,
+            )["input_ids"]
+            # Seed with first token from knowledge
+            seed = knowledge_tokens[:1]
+            tgt_ids = torch.tensor([[bos_id] + seed], device=device)
+        else:
+            tgt_ids = torch.tensor([[bos_id]], device=device)
 
         # Autoregressive generation with pointer-generator
         with torch.no_grad():
