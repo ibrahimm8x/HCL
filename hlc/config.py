@@ -42,11 +42,17 @@ class Config:
     lm_model_name: str = "mistralai/Mistral-7B-Instruct-v0.3"
     lm_max_new_tokens: int = 200
 
-    # === Decoder (replaces LLM when trained) ===
+    # === Decoder — MiniT5 (replaces LLM when trained) ===
     use_decoder: bool = False                    # True = use decoder, False = use LLM
-    decoder_model_name: str = "gpt2-medium"      # base model for fine-tuning
-    decoder_adapter_path: Path = field(default_factory=lambda: Path("/content/drive/MyDrive/HLC/data/decoder_adapter"))
-    decoder_max_new_tokens: int = 100            # decoder responses should be concise
+    decoder_d_model: int = 256                   # embedding dimension
+    decoder_n_heads: int = 4                     # attention heads
+    decoder_n_encoder_layers: int = 4            # encoder transformer layers
+    decoder_n_decoder_layers: int = 4            # decoder transformer layers
+    decoder_d_ff: int = 512                      # feedforward hidden dim
+    decoder_dropout: float = 0.1
+    decoder_max_seq_len: int = 512
+    decoder_max_output_tokens: int = 64          # response length (1-3 sentences)
+    decoder_model_path: Path = field(default_factory=lambda: Path("/content/drive/MyDrive/HLC/data/decoder_model"))
 
     # === Sparse Activation ===
     similarity_threshold: float = 0.35   # minimum cosine similarity to activate
@@ -98,5 +104,5 @@ class Config:
             faiss_dir=Path("/Users/biboahmed/AGI/data/faiss_index"),
             hebbian_path=Path("/Users/biboahmed/AGI/data/hebbian_graph.json"),
             event_log_path=Path("/Users/biboahmed/AGI/data/event_log.jsonl"),
-            decoder_adapter_path=Path("/Users/biboahmed/AGI/data/decoder_adapter"),
+            decoder_model_path=Path("/Users/biboahmed/AGI/data/decoder_model"),
         )
