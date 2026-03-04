@@ -488,6 +488,80 @@ class DecoderTrainer:
                 }) + "\n")
         print(f"Saved {len(examples)} training examples to {output_path}")
 
+    def pretrain_copy_task(
+        self,
+        output_data_path: Path,
+        output_model_path: Optional[Path] = None,
+        num_samples: int = 100000,
+        epochs: int = 10,
+        batch_size: int = 64,
+        learning_rate: float = 1e-4,
+        warmup_steps: int = 300,
+        max_len: int = 128,
+    ):
+        """
+        Phase 1: Copy pretraining on diverse English sentences.
+
+        Downloads AG News dataset (120K news sentences across world/sports/
+        business/science). Trains MiniT5 to copy sentences verbatim:
+
+            Encoder: "The economy grew by 3.5 percent."
+            Decoder: "<bos> The economy grew by 3.5 percent. <end>"
+
+        This teaches the model English grammar, word order, and vocabulary
+        through copying — zero factual knowledge is memorized.
+
+        Returns training history dict.
+        """
+        from datasets import load_dataset
+
+        output_model_path = output_model_path or self.config.decoder_model_path
+
+        # Download AG News
+        print("Downloading AG News dataset...")
+        ds = load_dataset("ag_news", split="train")
+        print(f"  Raw dataset: {len(ds)} examples")
+
+        # Filter: take sentences ≤ 40 words, clean up
+        examples = []
+        for item in ds:
+            text = item["text"].strip()
+            # Take first sentence if multiple
+            if ". " in text:
+                text = text[:text.index(". ") + 1]
+            words = text.split()
+            if 5 <= len(words) <= 40:
+                examples.append(text)
+            if len(examples) >= num_samples:
+                break
+
+        print(f"  Filtered to {len(examples)} sentences (5-40 words)")
+
+        # Format as JSONL: encoder_input = sentence, decoder_target = <bos> sentence <end>
+        output_data_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_data_path, "w") as f:
+            for text in examples:
+                f.write(json.dumps({
+                    "encoder_input": text,
+                    "decoder_target": f"{BOS_TOKEN} {text} {END_TOKEN}",
+                }) + "\n")
+        print(f"  Saved copy pretraining data to {output_data_path}")
+
+        # Train
+        print("\n=== Phase 1: Copy Pretraining ===")
+        history = self.train(
+            training_data_path=output_data_path,
+            output_model_path=output_model_path,
+            epochs=epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            warmup_steps=warmup_steps,
+            max_input_len=max_len,
+            max_output_len=max_len,
+            checkpoint_name="model_phase1.pt",
+        )
+        return history
+
     def train(
         self,
         training_data_path: Path,
@@ -499,10 +573,16 @@ class DecoderTrainer:
         max_input_len: int = 256,
         max_output_len: int = 64,
         val_split: float = 0.05,
+        resume_from: Optional[Path] = None,
+        checkpoint_name: str = "model_best.pt",
     ):
         """
-        Train MiniT5 from scratch on the generated dataset.
-        Standard seq2seq: teacher forcing, cross-entropy loss.
+        Train MiniT5 on the generated dataset.
+
+        Args:
+            resume_from: Path to a checkpoint file (.pt) to resume from.
+                         Used for Phase 2 to load Phase 1 weights.
+            checkpoint_name: Name for the best checkpoint file.
         """
         import torch
         from torch.utils.data import DataLoader, Dataset
@@ -528,6 +608,13 @@ class DecoderTrainer:
         )
         model = MiniT5(model_config).to(device)
         print(f"MiniT5 parameters: {model.param_count():,}")
+
+        # Resume from checkpoint if provided
+        if resume_from is not None:
+            print(f"Loading checkpoint from {resume_from}")
+            state_dict = torch.load(resume_from, map_location=device)
+            model.load_state_dict(state_dict)
+            print("  Checkpoint loaded.")
 
         # Load data
         print(f"Loading training data from {training_data_path}")
@@ -647,7 +734,7 @@ class DecoderTrainer:
             # Save best model by validation loss
             if avg_val < best_val_loss:
                 best_val_loss = avg_val
-                torch.save(model.state_dict(), output_model_path / "model_best.pt")
+                torch.save(model.state_dict(), output_model_path / checkpoint_name)
                 print(f"  Saved best model (val_loss={avg_val:.4f})")
 
         # Save final model + copy best as the default
@@ -657,7 +744,7 @@ class DecoderTrainer:
 
         # Use best model as the default
         import shutil
-        best_path = output_model_path / "model_best.pt"
+        best_path = output_model_path / checkpoint_name
         if best_path.exists():
             shutil.copy(best_path, output_model_path / "model.pt")
             print(f"Using best model (val_loss={best_val_loss:.4f}) as model.pt")
