@@ -1,7 +1,7 @@
 """ColumnStore: manages the lifecycle of all memory columns."""
 import torch
 import numpy as np
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Set
 
 from hlc.config import Config
 from hlc.column import MemoryColumn
@@ -75,12 +75,23 @@ class ColumnStore:
 
         return None
 
-    def find_relevant(self, input_vector: np.ndarray) -> List[Tuple[str, float]]:
+    def find_relevant(
+        self,
+        input_vector: np.ndarray,
+        exclude_ids: Optional[Set[str]] = None,
+    ) -> List[Tuple[str, float]]:
         """
         Sparse activation: find columns relevant to input.
         Returns (column_id, similarity) pairs above threshold.
+
+        Args:
+            exclude_ids: Column IDs to exclude from results (for multi-hop
+                         reasoning — avoid re-discovering already-seen columns).
         """
-        return self.index.query(input_vector)
+        results = self.index.query(input_vector)
+        if exclude_ids:
+            results = [(cid, score) for cid, score in results if cid not in exclude_ids]
+        return results
 
     def activate_column(
         self,

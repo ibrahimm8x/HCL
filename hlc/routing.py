@@ -1,7 +1,8 @@
 """Routing Loop: the reasoning engine. Fixed dynamics, no learnable weights."""
 import torch
 import torch.nn.functional as F
-from typing import List, Tuple, Optional
+import numpy as np
+from typing import List, Tuple, Optional, Set
 from dataclasses import dataclass, field
 
 from hlc.config import Config
@@ -22,21 +23,43 @@ class RoutingResult:
     prediction_error: float
     value_state: ValueState
     mode: str  # "fast", "light", "slow"
+    reasoning_trace: List[List[str]] = field(default_factory=list)
 
 
 class RoutingLoop:
     """
-    The 6-step routing loop. This IS reasoning.
+    The routing loop. This IS reasoning.
 
-    Fixed dynamical system — no learnable weights. The intelligence
-    comes from how activation routes between memory columns.
+    A fixed dynamical system — no learnable weights. Intelligence
+    emerges from how activation routes between memory columns
+    through multi-hop discovery and competition.
 
-    Step 1: Column interaction via Hebbian links (spreading activation)
-    Step 2: Competition (winner-take-all among hypotheses)
-    Step 3: Prediction (current state generates expected pattern)
-    Step 4: Error signal (prediction vs reality)
-    Step 5: Value adjustment (emit motivational signals)
-    Step 6: Convergence check (stable? exit. unstable? loop.)
+    Each iteration runs 7 steps:
+
+    1. Multi-hop discovery — re-query the index with the EVOLVING
+       understanding (combined state of working memory), not the
+       original query. This finds knowledge that was unreachable
+       from the original question but is reachable from what we've
+       found so far. This is genuine multi-hop inference.
+
+    2. Spreading activation — pull in Hebbian-linked neighbors.
+       Associative connections propagate energy to related columns.
+
+    3. Competition — columns must be relevant to BOTH the original
+       query (stay on-topic) AND the evolving context (fit the
+       emerging answer). Blended similarity prevents both drift
+       and tunnel vision.
+
+    4. Prediction — combine active patterns into current understanding.
+
+    5. Error signal — how well does the current state explain the input?
+
+    6. Value evaluation — emit motivational signals (joy, curiosity,
+       pain, surprise, fear).
+
+    7. Convergence — stop when no new knowledge is discoverable AND
+       the state is stable. This means: "I've exhausted what I can
+       find" — not "my state matches the query."
     """
 
     def __init__(
@@ -79,9 +102,10 @@ class RoutingLoop:
         """
         Execute the routing loop.
 
-        This is the complete reasoning process: activation flows
-        between columns, hypotheses compete, predictions are checked,
-        and the system iterates until convergence.
+        Multi-hop reasoning: each iteration discovers new knowledge based
+        on the evolving understanding, not just the original query. The
+        system builds up an answer through sequential discovery, naturally
+        chaining facts that no single retrieval step could find.
         """
         device = self.config.get_device()
         mode = self.determine_mode(initial_matches)
@@ -98,6 +122,13 @@ class RoutingLoop:
             if pattern is not None:
                 self.wm.load_column(col_id, pattern, priority=score)
 
+        # Track reasoning: which columns were discovered at each hop
+        initial_ids = list(self.wm.get_active_ids())
+        reasoning_trace: List[List[str]] = [initial_ids] if initial_ids else []
+
+        # Track all columns ever seen in this run — multi-hop never re-visits
+        seen_ids: Set[str] = set(self.wm.get_active_ids())
+
         # Fast path: direct retrieval, skip the loop entirely
         if mode == "fast":
             state = self.wm.get_combined_state()
@@ -112,37 +143,96 @@ class RoutingLoop:
                 prediction_error=0.0,
                 value_state=self.value.state,
                 mode=mode,
+                reasoning_trace=reasoning_trace,
             )
 
-        # Slow / Light path: run the routing loop
+        # Slow / Light path: run the reasoning loop
         input_on_device = input_pattern.to(device)
         previous_state = None
         prediction_error = 1.0
         novelty = 1.0 - (initial_matches[0][1] if initial_matches else 0.0)
 
         for iteration in range(max_iters):
-            # --- STEP 1: Spreading activation via Hebbian links ---
+            hop_discoveries: List[str] = []
+
+            # --- STEP 1: Multi-hop discovery ---
+            # Re-query the index with our CURRENT UNDERSTANDING.
+            # The combined state represents "everything we know so far" —
+            # searching with it finds knowledge related to our emerging
+            # answer, not just the original question.
+            #
+            # Example: Query "Do plants need sun to make oxygen?"
+            #   Hop 0: finds "photosynthesis" + "plants need sunlight"
+            #   Hop 1: combined state ≈ plants+sunlight+photosynthesis
+            #          → discovers "oxygen production" column
+            #   Hop 2: no new columns → converge with full chain
+            current_state = self.wm.get_combined_state()
+            if current_state is not None:
+                state_numpy = current_state.detach().cpu().numpy()
+                hop_matches = self.store.find_relevant(
+                    state_numpy, exclude_ids=seen_ids,
+                )
+                for col_id, score in hop_matches[:3]:  # max 3 new per hop
+                    pattern = self.store.activate_column(col_id, input_pattern)
+                    if pattern is not None:
+                        # Discoveries from context get slightly lower priority
+                        # than direct query matches — they're supporting evidence
+                        self.wm.load_column(col_id, pattern, priority=score * 0.8)
+                        hop_discoveries.append(col_id)
+                        seen_ids.add(col_id)
+
+            # --- STEP 2: Spreading activation via Hebbian links ---
+            # Associative connections: columns that have co-activated before
+            # send energy to their neighbors. This pulls in conceptually
+            # linked knowledge even if it's not semantically similar.
             active_ids = set(self.wm.get_active_ids())
             spreading = self.graph.get_spreading_activation(active_ids, top_k=3)
             for neighbor_id, link_weight in spreading:
-                neighbor_pattern = self.store.activate_column(
-                    neighbor_id, input_pattern,
-                )
-                if neighbor_pattern is not None:
-                    self.wm.load_column(
-                        neighbor_id, neighbor_pattern,
-                        priority=link_weight * 0.5,
+                if neighbor_id not in active_ids:
+                    neighbor_pattern = self.store.activate_column(
+                        neighbor_id, input_pattern,
                     )
+                    if neighbor_pattern is not None:
+                        self.wm.load_column(
+                            neighbor_id, neighbor_pattern,
+                            priority=link_weight * 0.5,
+                        )
+                        if neighbor_id not in seen_ids:
+                            hop_discoveries.append(neighbor_id)
+                            seen_ids.add(neighbor_id)
 
-            # --- STEP 2: Competition ---
-            # Columns that align with input get amplified; others get suppressed
+            # Record what this hop discovered
+            if hop_discoveries:
+                reasoning_trace.append(hop_discoveries)
+
+            # --- STEP 3: Competition ---
+            # Columns must be relevant to BOTH the original query AND
+            # the evolving context. This dual criterion:
+            # - Prevents drift: columns unrelated to the question get suppressed
+            # - Allows discovery: columns related to the CONTEXT (not the
+            #   question directly) can survive if they fit the emerging answer
+            combined = self.wm.get_combined_state()
             patterns = self.wm.get_active_patterns()
             for col_id, pattern in patterns.items():
-                sim = F.cosine_similarity(
+                # How relevant is this column to the original question?
+                query_sim = F.cosine_similarity(
                     pattern.unsqueeze(0), input_on_device.unsqueeze(0),
                 ).item()
+
+                # How relevant is it to our evolving understanding?
+                context_sim = 0.5
+                if combined is not None:
+                    context_sim = F.cosine_similarity(
+                        pattern.unsqueeze(0), combined.unsqueeze(0),
+                    ).item()
+
+                # Blend: 60% query relevance + 40% context relevance
+                # This keeps the system on-topic while allowing multi-hop
+                # discoveries to survive competition
+                blended_sim = 0.6 * query_sim + 0.4 * context_sim
+
                 old_priority = self.wm.priorities.get(col_id, 0.5)
-                adjustment = self.config.competition_strength * (sim - 0.5)
+                adjustment = self.config.competition_strength * (blended_sim - 0.5)
                 new_priority = old_priority * (1.0 + adjustment)
                 self.wm.priorities[col_id] = max(0.01, min(1.0, new_priority))
 
@@ -150,29 +240,37 @@ class RoutingLoop:
             while self.wm.size() > self.config.working_memory_capacity:
                 self.wm._evict_lowest()
 
-            # --- STEP 3: Prediction ---
+            # --- STEP 4: Prediction ---
             current_state = self.wm.get_combined_state()
             if current_state is None:
                 current_state = input_on_device
 
-            # --- STEP 4: Error signal ---
+            # --- STEP 5: Error signal ---
             prediction_error = 1.0 - F.cosine_similarity(
                 current_state.unsqueeze(0), input_on_device.unsqueeze(0),
             ).item()
 
-            # --- STEP 5: Value evaluation ---
+            # --- STEP 6: Value evaluation ---
             match_conf = (
                 max(s for _, s in initial_matches) if initial_matches else 0.0
             )
             self.value.evaluate(prediction_error, novelty, match_conf)
 
-            # --- STEP 6: Convergence check ---
+            # --- STEP 7: Convergence check ---
+            # Converge when knowledge is exhausted AND state is stable.
+            # "Knowledge exhausted" = this iteration found no new columns.
+            # "State stable" = working memory composition barely changed.
+            #
+            # This means:
+            # - Simple questions: converge in 1-2 hops (quickly exhausted)
+            # - Complex questions: keep searching until nothing new found
+            # - The system naturally "thinks harder" on harder questions
             if previous_state is not None:
                 state_delta = (current_state - previous_state).norm().item()
-                if (
-                    prediction_error < self.config.convergence_threshold
-                    or state_delta < 0.01
-                ):
+                knowledge_exhausted = len(hop_discoveries) == 0
+                state_stable = state_delta < 0.01
+
+                if (knowledge_exhausted and state_stable) or state_delta < 0.005:
                     return RoutingResult(
                         converged=True,
                         iterations=iteration + 1,
@@ -182,6 +280,7 @@ class RoutingLoop:
                         prediction_error=prediction_error,
                         value_state=self.value.state,
                         mode=mode,
+                        reasoning_trace=reasoning_trace,
                     )
 
             previous_state = current_state.clone()
@@ -198,6 +297,7 @@ class RoutingLoop:
             prediction_error=prediction_error,
             value_state=self.value.state,
             mode=mode,
+            reasoning_trace=reasoning_trace,
         )
 
     def _get_source_texts(self) -> List[str]:

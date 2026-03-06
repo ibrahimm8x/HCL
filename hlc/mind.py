@@ -157,6 +157,16 @@ class Mind:
 
         self.persistence.save_all(self.store, self.graph)
 
+        # Build reasoning trace with source texts
+        trace_texts = []
+        for hop_ids in result.reasoning_trace:
+            hop_texts = []
+            for cid in hop_ids:
+                col = self.store.get_column(cid)
+                if col and col.metadata.source_text:
+                    hop_texts.append(col.metadata.source_text[:80])
+            trace_texts.append(hop_texts)
+
         return {
             "mode": result.mode,
             "converged": result.converged,
@@ -167,6 +177,7 @@ class Mind:
             "value_state": str(result.value_state),
             "matches": [(cid, f"{score:.3f}") for cid, score in matches],
             "new_column_created": new_column_created,
+            "reasoning_trace": trace_texts,
         }
 
     def seed_knowledge(self, facts: List[str], verbose: bool = True):
